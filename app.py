@@ -1,72 +1,137 @@
-import streamlit as st
-import cv2
 import tempfile
-from ultralytics import YOLO
 from collections import defaultdict
 
-st.set_page_config(page_title="Live Perception", layout="wide")
-st.title("Real Time Object Detection and Tracking")
-
-# Sidebar controls
-source_type = st.sidebar.radio("Source", ["Upload video", "Webcam", "Phone stream URL"])
-conf = st.sidebar.slider("Confidence", 0.1, 0.9, 0.4)
-model_name = st.sidebar.selectbox(
-    "Model (bigger = more accurate, slower)",
-    ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt"],
-)
+import cv2
+import streamlit as st
+from ultralytics import YOLO
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading model...")
 def load_model(name):
     return YOLO(name)
 
 
-model = load_model(model_name)
-
-# Resolve source
-if source_type == "Upload video":
-    uploaded = st.sidebar.file_uploader("Choose a video", type=["mp4", "mov", "avi"])
-    if uploaded:
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(uploaded.read())
-        source = tfile.name
-    else:
-        source = None
-elif source_type == "Webcam":
-    source = int(
-        st.sidebar.number_input("Camera index", min_value=0, max_value=5, value=1, step=1)
+def render_sidebar():
+    st.sidebar.header("Source")
+    source_type = st.sidebar.radio(
+        "Input",
+        ["Upload video", "Webcam", "Phone stream URL"],
+        label_visibility="collapsed",
     )
-else:
-    source = st.sidebar.text_input("Phone stream URL", "http://192.168.1.42:8080/video")
 
-# Start/Stop controls
-if "running" not in st.session_state:
-    st.session_state.running = False
-if st.sidebar.button("Start"):
-    st.session_state.running = True
-if st.sidebar.button("Stop"):
-    st.session_state.running = False
+    uploaded = cam_index = stream_url = None
+    if source_type == "Upload video":
+        uploaded = st.sidebar.file_uploader("Video file", type=["mp4", "mov", "avi"])
+    elif source_type == "Webcam":
+        cam_index = st.sidebar.number_input(
+            "Camera index", min_value=0, max_value=5, value=1, step=1,
+        )
+    else:
+        stream_url = st.sidebar.text_input(
+            "Phone stream URL", "http://192.168.1.42:8080/video",
+        )
 
-# Run inference if source is set
-if source is not None and st.session_state.running:
-    frame_placeholder = st.empty()
-    stats_placeholder = st.sidebar.empty()
-    counts = defaultdict(set)
+    st.sidebar.header("Detector")
+    model_name = st.sidebar.selectbox(
+        "Model size (bigger is more accurate but slower)",
+        [
+            "yolov8n-oiv7.pt",
+            "yolov8s-oiv7.pt",
+            "yolov8m-oiv7.pt",
+            "yolov8l-oiv7.pt",
+            "yolov8x-oiv7.pt",
+        ],
+        index=2,
+    )
+
+    conf = st.sidebar.slider("Confidence threshold", 0.1, 0.9, 0.4, 0.05)
+
+    st.sidebar.header("Controls")
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button("Start", use_container_width=True):
+        st.session_state.running = True
+    if c2.button("Stop", use_container_width=True):
+        st.session_state.running = False
+
+    return {
+        "source_type": source_type,
+        "uploaded": uploaded,
+        "cam_index": cam_index,
+        "stream_url": stream_url,
+        "model_name": model_name,
+        "conf": conf,
+    }
+
+
+def resolve_source(cfg):
+    if cfg["source_type"] == "Upload video":
+        if cfg["uploaded"] is None:
+            return None
+
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(cfg["uploaded"].read())
+        return tfile.name
+    if cfg["source_type"] == "Webcam":
+        return int(cfg["cam_index"])
+    return cfg["stream_url"]
+
+
+def render_stats(slot, counts):
+    if not counts:
+        slot.markdown("**Detections**\n\n_(none in this frame)_")
+        return
+    lines = ["**Detections (current frame)**", ""]
+    for k, v in sorted(counts.items(), key=lambda kv: -kv[1]):
+        lines.append(f"- {k}: {v}")
+    slot.markdown("\n".join(lines))
+
+
+def run_inference(cfg, source, frame_slot, stats_slot):
+    model = load_model(cfg["model_name"])
+    counts = defaultdict(int)
+
+    for r in model.predict(
+        source=source, stream=True, conf=cfg["conf"], verbose=False,
+    ):
+        if not st.session_state.running:
+            break
+
+        frame = r.plot()
+        frame_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        counts.clear()
+        if r.boxes is not None:
+            for cls in r.boxes.cls.tolist():
+                counts[model.names[int(cls)]] += 1
+        render_stats(stats_slot, counts)
+
+
+def main():
+    st.set_page_config(page_title="Live Object Detection", layout="wide")
+    st.session_state.setdefault("running", False)
+    st.caption("Live object detection")
+
+    cfg = render_sidebar()
+    source = resolve_source(cfg)
+
+    col_video, col_stats = st.columns([3, 1])
+    frame_slot = col_video.empty()
+    stats_slot = col_stats.empty()
+
+    if source is None:
+        frame_slot.info("Pick a source and press Start")
+        return
+
+    if not st.session_state.running:
+        frame_slot.info("Source is ready. Press Start")
+        return
 
     try:
-        for r in model.track(source=source, stream=True, conf=conf, tracker="bytetrack.yaml"):
-            frame = r.plot()
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_placeholder.image(frame_rgb)
-
-            # Track unique IDs per class
-            if r.boxes.id is not None:
-                for cls, track_id in zip(r.boxes.cls.tolist(), r.boxes.id.tolist()):
-                    counts[model.names[int(cls)]].add(int(track_id))
-
-            # Show counts
-            summary = "\n".join(f"**{k}**: {len(v)} unique" for k, v in counts.items())
-            stats_placeholder.markdown(summary or "No detections yet")
+        run_inference(cfg, source, frame_slot, stats_slot)
     except Exception as e:
         st.session_state.running = False
         st.error(f"Could not open source: {source}\n\n{e}")
+
+
+if __name__ == "__main__":
+    main()
