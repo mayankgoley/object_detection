@@ -52,6 +52,9 @@ def render_sidebar():
         st.session_state.running = True
     if c2.button("Stop", use_container_width=True):
         st.session_state.running = False
+    
+    if st.sidebar.button("Reset counts", use_container_width=True):
+        st.session_state.unique_ids_per_class = defaultdict(set)
 
     return {
         "source_type": source_type,
@@ -75,8 +78,38 @@ def resolve_source(cfg):
         return int(cfg["cam_index"])
     return cfg["stream_url"]
 
+def draw_boxes(frame, boxes, class_names):
+    out = frame.copy()
+    if boxes is None or len(boxes) == 0:
+        return out
+    
+    for box in boxes:
+        cls_id = int(box.cls[0])
+        cls_name = class_names[cls_id]
+        confidence = float(box.conf[0])
 
-def render_stats(slot, counts):
+        track_id = int(box.id[0]) if box.id is not None else None
+        x1, y1, x2, y2, = map(int, box.xyxy[0].tolist())
+
+        color = (0, 200, 0)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+        parts = [cls_name]
+        if track_id is not None:
+            parts.append(f"id:{track_id}")
+        parts.append(f"{confidence:.2f}")
+        label = " ".join(parts)
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(out, (x1, y1-th-6), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(
+            out, label, (x1 +3, y1 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+    return out
+
+
+def render_current_frame_stats(slot, counts):
     if not counts:
         slot.markdown("**Detections**\n\n_(none in this frame)_")
         return
@@ -85,38 +118,61 @@ def render_stats(slot, counts):
         lines.append(f"- {k}: {v}")
     slot.markdown("\n".join(lines))
 
+def render_unique_stats(slot, unique_ids_per_class):
+    if not unique_ids_per_class:
+        slot.markdown("Unique counts:\n (none yet)")
+        return
+    lines = ["Unique objects seen"]
+    for k, ids in sorted(unique_ids_per_class.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"{k}: {len(ids)}")
+    slot.markdown("\n".join(lines))
 
-def run_inference(cfg, source, frame_slot, stats_slot):
+
+def run_inference(cfg, source, frame_slot, current_slot, unique_slot):
     model = load_model(cfg["model_name"])
-    counts = defaultdict(int)
-
-    for r in model.predict(
-        source=source, stream=True, conf=cfg["conf"], verbose=False,
+    current_counts = defaultdict(int)
+    unique_ids_per_class = st.session_state.unique_ids_per_class
+ 
+    for r in model.track(
+        source=source,
+        stream=True,
+        conf=cfg["conf"],
+        tracker="bytetrack.yaml",
+        persist=True,
+        verbose=False,
     ):
         if not st.session_state.running:
             break
 
-        frame = r.plot()
-        frame_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        counts.clear()
+        drawn = draw_boxes(r.orig_img, r.boxes, model.names)
+        frame_slot.image(cv2.cvtColor(drawn, cv2.COLOR_BGR2RGB))
+        
+        current_counts.clear()
         if r.boxes is not None:
-            for cls in r.boxes.cls.tolist():
-                counts[model.names[int(cls)]] += 1
-        render_stats(stats_slot, counts)
+            for box in r.boxes:
+                cls_name = model.names[int(box.cls[0])]
+                current_counts[cls_name] += 1
+                if box.id is not None:
+                    unique_ids_per_class[cls_name].add(int(box.id[0]))
+    
+        render_current_frame_stats(current_slot, current_counts)
+        render_unique_stats(unique_slot, unique_ids_per_class)
 
 
 def main():
     st.set_page_config(page_title="Live Object Detection", layout="wide")
     st.session_state.setdefault("running", False)
-    st.caption("Live object detection")
+    st.session_state.setdefault("unique_ids_per_class", defaultdict(set))
+    st.title("Live Object Detection and tracking")
+    st.caption("Live object detection with track ids")
 
     cfg = render_sidebar()
     source = resolve_source(cfg)
 
     col_video, col_stats = st.columns([3, 1])
     frame_slot = col_video.empty()
-    stats_slot = col_stats.empty()
+    current_slot = col_stats.empty()
+    unique_slot = col_stats.empty()
 
     if source is None:
         frame_slot.info("Pick a source and press Start")
@@ -127,7 +183,7 @@ def main():
         return
 
     try:
-        run_inference(cfg, source, frame_slot, stats_slot)
+        run_inference(cfg, source, frame_slot, current_slot, unique_slot)
     except Exception as e:
         st.session_state.running = False
         st.error(f"Could not open source: {source}\n\n{e}")
