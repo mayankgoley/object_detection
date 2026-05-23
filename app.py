@@ -10,6 +10,9 @@ from ultralytics import YOLO
 def load_model(name):
     return YOLO(name)
 
+def parse_classes(text):
+    return [c.strip() for c in text.split(",") if c.strip()]
+
 
 def render_sidebar():
     st.sidebar.header("Source")
@@ -31,18 +34,36 @@ def render_sidebar():
             "Phone stream URL", "http://192.168.1.42:8080/video",
         )
 
-    st.sidebar.header("Detector")
-    model_name = st.sidebar.selectbox(
-        "Model size (bigger is more accurate but slower)",
-        [
-            "yolov8n-oiv7.pt",
-            "yolov8s-oiv7.pt",
-            "yolov8m-oiv7.pt",
-            "yolov8l-oiv7.pt",
-            "yolov8x-oiv7.pt",
-        ],
-        index=2,
+    detector_mode = st.sidebar.radio(
+        "Mode",
+        ["Closed set (YOLOv8-OIv7)", "Open vocabulary (YOLO-World)"],
+        help=(
+            "Closed set: 600 fixed classes from Open Images V7. Fast. "
+            "Open vocab: type any class names, YOLO-World detects them. Slower."
+        ),
     )
+
+    custom_classes_text = ""
+    if detector_mode == "Closed set (YOLOv8-OIv7)":
+        model_name = st.sidebar.selectbox(
+            "Model size (bigger means more accurate, slower)",
+            [
+                "yolov8n-oiv7.pt", "yolov8s-oiv7.pt", "yolov8m-oiv7.pt",
+                "yolov8l-oiv7.pt", "yolov8x-oiv7.pt",
+            ],
+            index=2,
+        )
+    else:
+        model_name = st.sidebar.selectbox(
+            "Model size",
+            ["yolov8s-worldv2.pt", "yolov8m-worldv2.pt", "yolov8l-worldv2.pt"],
+            index=0,
+        )
+        custom_classes_text = st.sidebar.text_area(
+            "Classes (comma separated)",
+            "person, closet, window, door, chair, table, bed, tv, laptop",
+            help="Type any object names. YOLO-World will detect only these.",
+        )
 
     conf = st.sidebar.slider("Confidence threshold", 0.1, 0.9, 0.4, 0.05)
 
@@ -61,7 +82,9 @@ def render_sidebar():
         "uploaded": uploaded,
         "cam_index": cam_index,
         "stream_url": stream_url,
+        "detector_mode": detector_mode,
         "model_name": model_name,
+        "custom_classes_text": custom_classes_text,
         "conf": conf,
     }
 
@@ -78,7 +101,7 @@ def resolve_source(cfg):
         return int(cfg["cam_index"])
     return cfg["stream_url"]
 
-def draw_boxes(frame, boxes, class_names):
+def draw_boxes(frame, boxes, class_names, box_color):
     out = frame.copy()
     if boxes is None or len(boxes) == 0:
         return out
@@ -91,23 +114,19 @@ def draw_boxes(frame, boxes, class_names):
         track_id = int(box.id[0]) if box.id is not None else None
         x1, y1, x2, y2, = map(int, box.xyxy[0].tolist())
 
-        color = (0, 200, 0)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
+        cv2.rectangle(out, (x1, y1), (x2, y2), box_color, 2)
         parts = [cls_name]
         if track_id is not None:
             parts.append(f"id:{track_id}")
         parts.append(f"{confidence:.2f}")
         label = " ".join(parts)
-
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(out, (x1, y1-th-6), (x1 + tw + 6, y1), color, -1)
+        cv2.rectangle(out, (x1, y1-th-6), (x1 + tw + 6, y1), box_color, -1)
         cv2.putText(
             out, label, (x1 +3, y1 - 4),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
         )
     return out
-
 
 def render_current_frame_stats(slot, counts):
     if not counts:
@@ -130,6 +149,14 @@ def render_unique_stats(slot, unique_ids_per_class):
 
 def run_inference(cfg, source, frame_slot, current_slot, unique_slot):
     model = load_model(cfg["model_name"])
+    if cfg["detector_mode"] == "Open vocabulary (YOLO-World)":
+        classes = parse_classes(cfg["custom_classes_text"])
+        if classes:
+            model.set_classes(classes)
+        box_color = (0, 165, 255)
+    else:
+        box_color = (0, 200, 0)
+
     current_counts = defaultdict(int)
     unique_ids_per_class = st.session_state.unique_ids_per_class
  
@@ -144,7 +171,7 @@ def run_inference(cfg, source, frame_slot, current_slot, unique_slot):
         if not st.session_state.running:
             break
 
-        drawn = draw_boxes(r.orig_img, r.boxes, model.names)
+        drawn = draw_boxes(r.orig_img, r.boxes, model.names, box_color)
         frame_slot.image(cv2.cvtColor(drawn, cv2.COLOR_BGR2RGB))
         
         current_counts.clear()
