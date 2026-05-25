@@ -3,3 +3,5 @@ ultralytics
 opencv-python-headless
 torch
 torchvision
+streamlit-webrtc
+av
