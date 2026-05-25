@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 runs/
+.vscode/
+yolov8m-oiv7.pt
+*.pt
